@@ -48,7 +48,8 @@ def main() -> None:
     with model_path.open("wb") as f:
         pickle.dump(model, f)
 
-    print(f"✅ Model trained and saved to {model_path}")
+    # Use ASCII-only status message to avoid Windows console encoding issues
+    print(f"Model trained and saved to {model_path}")
 
 
 if __name__ == "__main__":

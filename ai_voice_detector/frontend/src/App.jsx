@@ -1,12 +1,16 @@
 import React, { useState } from "react";
 
-const API_URL = "http://127.0.0.1:8000/detect-voice";
+// Point to the running backend; adjust port if the API runs elsewhere.
+const API_BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+const API_URL = API_BASE.endsWith("/detect-voice")
+  ? API_BASE
+  : `${API_BASE.replace(/\/$/, "")}/detect-voice`;
 
 export default function App() {
   const [file, setFile] = useState(null);
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(0);
+  const [error, setError] = useState(null);
 
   const toBase64 = (blob) =>
     new Promise((resolve, reject) => {
@@ -36,7 +40,14 @@ export default function App() {
       const data = await resp.json();
       setResult(data);
     } catch (err) {
-      setError(err.message || "Request failed");
+      const message = err?.message || "Request failed";
+      if (message.includes("Failed to fetch")) {
+        setError(
+          "Could not reach the API. Ensure the FastAPI server is running at http://127.0.0.1:8000 and try again."
+        );
+      } else {
+        setError(message);
+      }
     } finally {
       setLoading(false);
     }
@@ -66,7 +77,9 @@ export default function App() {
             <div className="pill">{result.classification}</div>
             <div className="confidence">Confidence: {result.confidence}</div>
             <div className="language">
-              Language: {result.language} ({(result.language_confidence * 100).toFixed(0)}%)
+              Language: {result.language} 
+              {result.language !== "Unknown" && ` (${(result.language_confidence * 100).toFixed(0)}%)`}
+              {result.language === "Unknown" && " - Not in supported languages (en, hi, ta, te, ml)"}
             </div>
             <div className="explanation">{result.explanation}</div>
           </div>

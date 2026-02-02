@@ -1,11 +1,8 @@
 import base64
-import uuid
-from pathlib import Path
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from .predict import predict_audio
+from .predict import predict_audio, predict_audio_bytes
 
 app = FastAPI()
 
@@ -27,20 +24,14 @@ def detect_voice(data: dict):
         raise HTTPException(status_code=400, detail="Missing 'audio' field")
 
     audio_base64 = data["audio"]
-
-    temp_path = Path(f"temp_{uuid.uuid4()}.mp3")
     try:
-        temp_path.write_bytes(base64.b64decode(audio_base64))
+        audio_bytes = base64.b64decode(audio_base64)
+        if not audio_bytes:
+            raise ValueError("empty audio")
     except Exception as exc:  # pragma: no cover - defensive
-        if temp_path.exists():
-            temp_path.unlink()
         raise HTTPException(status_code=400, detail="Invalid audio payload") from exc
 
-    try:
-        prediction = predict_audio(temp_path)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink()
+    prediction = predict_audio_bytes(audio_bytes)
 
     return {
         "classification": prediction["label"],
