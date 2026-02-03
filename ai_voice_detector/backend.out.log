@@ -1,1 +1,21 @@
-INFO:     127.0.0.1:51487 - "GET / HTTP/1.1" 200 OK
+
+================================================================================
+AI FRAUD CALL ANALYZER - API SERVER
+================================================================================
+
+Starting API server...
+  * API: http://127.0.0.1:8000
+  * Docs: http://127.0.0.1:8000/docs
+  * Frontend: http://localhost:5173
+
+Press CTRL+C to stop
+
+================================================================================
+
+INFO:     127.0.0.1:51295 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61736 - "OPTIONS /analyze-call HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61736 - "POST /analyze-call HTTP/1.1" 200 OK
+INFO:     127.0.0.1:61736 - "GET /alert-history?limit=10 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50345 - "OPTIONS /detect-voice HTTP/1.1" 200 OK
+INFO:     127.0.0.1:50345 - "POST /detect-voice HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60040 - "POST /detect-voice HTTP/1.1" 200 OK

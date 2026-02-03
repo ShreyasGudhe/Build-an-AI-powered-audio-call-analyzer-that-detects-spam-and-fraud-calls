@@ -7,9 +7,13 @@ from typing import Dict, Iterable, Optional, Tuple, List
 
 import requests
 import numpy as np
+import tempfile
+import soundfile as sf
 
 from faster_whisper import WhisperModel
 from faster_whisper.transcribe import decode_audio
+from pydub import AudioSegment
+from pydub.silence import split_on_silence
 
 from .feature_extraction import extract_features
 
@@ -562,69 +566,375 @@ def resolve_language_name(code: str) -> str:
     return LANGUAGE_NAMES.get(code, code.upper())
 
 
+# Fraud detection keywords - Enhanced categories
+FRAUD_KEYWORDS = {
+    "financial": ["otp", "cvv", "pin", "password", "account number", "card number", "ifsc", "upi", "net banking"],
+    "identity": ["aadhaar", "pan", "passport", "voter id", "driving license", "kyc", "verification", "verify now"],
+    "urgency": ["urgent", "immediately", "right now", "expire", "suspend", "block", "freeze", "deactivate"],
+    "authority": ["police", "cyber cell", "income tax", "rbi", "court", "legal action", "arrest warrant", "fir"],
+    "rewards": ["lottery", "prize", "won", "reward", "cashback", "refund", "claim now", "congratulations"],
+    "payment": ["payment", "pay now", "transfer", "deposit", "remittance", "wire transfer", "transaction"],
+    "threat": ["bank blocked", "account blocked", "suspended", "legal consequences", "penalty", "fine"],
+}
+
+
+def detect_fraud_keywords(audio_path: Path) -> Tuple[bool, str, List[str], Dict[str, int]]:
+    """Enhanced transcribe audio and check for fraud-related keywords with categorization.
+    
+    Returns:
+        (is_fraud, transcribed_text, detected_keywords, category_counts): 
+        is_fraud is True if fraud keywords detected, with details on what was found.
+    """
+    try:
+        text = _transcribe_snippet(audio_path, max_seconds=_MAX_AUDIO_SECONDS)
+        if not text:
+            return False, "", [], {}
+        
+        text_lower = text.lower()
+        detected_keywords = []
+        category_counts = {cat: 0 for cat in FRAUD_KEYWORDS.keys()}
+        
+        for category, keywords in FRAUD_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in text_lower:
+                    detected_keywords.append(keyword)
+                    category_counts[category] += 1
+        
+        # Calculate fraud risk based on detection patterns
+        is_fraud = len(detected_keywords) > 0
+        
+        # High-risk patterns: multiple categories or high-risk single keywords
+        high_risk_keywords = ["otp", "cvv", "pin", "password", "account number", "police", "arrest warrant"]
+        has_high_risk = any(kw in text_lower for kw in high_risk_keywords)
+        multiple_categories = sum(1 for count in category_counts.values() if count > 0) >= 2
+        
+        # Enhanced fraud detection: mark as fraud if high-risk patterns detected
+        is_fraud = is_fraud and (has_high_risk or multiple_categories or len(detected_keywords) >= 2)
+        
+        return is_fraud, text, list(set(detected_keywords)), category_counts
+    except Exception:
+        return False, "", [], {}
+
+
 def predict_audio(audio_path) -> Dict[str, object]:
     path = Path(audio_path)
     if not path.exists():
         raise FileNotFoundError(f"Audio file not found: {path}")
+    
+    # 1. AI vs Human voice detection using trained model
     features = extract_features(path)
     prob = model.predict_proba([features])[0]
     prediction = model.predict([features])[0]
-
-    label = "AI-generated" if prediction == 1 else "Human"
-    confidence = max(prob)
-
-    explanation = (
+    
+    voice_type = "AI-generated" if prediction == 1 else "Human"
+    voice_confidence = max(prob)
+    voice_explanation = (
         "Synthetic spectral patterns detected"
-        if label == "AI-generated"
+        if voice_type == "AI-generated"
         else "Natural pitch and prosody detected"
     )
-
+    
+    # 2. Enhanced fraud keyword detection
+    is_fraud, transcribed_text, detected_keywords, category_counts = detect_fraud_keywords(path)
+    
+    # Calculate fraud risk level based on findings
+    fraud_risk_level = None
+    fraud_confidence = 0.90
+    if is_fraud:
+        num_categories = sum(1 for count in category_counts.values() if count > 0)
+        total_keywords = len(detected_keywords)
+        
+        if num_categories >= 3 or total_keywords >= 5:
+            fraud_risk_level = "CRITICAL"
+            fraud_confidence = 0.98
+        elif num_categories >= 2 or total_keywords >= 3:
+            fraud_risk_level = "HIGH"
+            fraud_confidence = 0.95
+        elif num_categories >= 1 or total_keywords >= 2:
+            fraud_risk_level = "MEDIUM"
+            fraud_confidence = 0.90
+        else:
+            fraud_confidence = 0.85
+    
+    # Build fraud explanation
+    if is_fraud:
+        fraud_label = "Fraud"
+        fraud_explanation = f"Detected {len(detected_keywords)} fraud keywords across {sum(1 for c in category_counts.values() if c > 0)} categories: "
+        fraud_explanation += ", ".join([f"{cat.title()} ({count})" for cat, count in category_counts.items() if count > 0])
+    else:
+        fraud_label = "Safe Call"
+        fraud_explanation = "No fraud indicators detected in the audio content"
+    
+    # 3. Detect language
     lang_code, lang_prob = detect_language(path)
 
+    # Combined result with both voice type and fraud detection
     return {
-        "label": label,
-        "confidence": float(confidence),
-        "explanation": explanation,
+        # Fraud detection results
+        "classification": fraud_label,
+        "label": fraud_label,
+        "confidence": float(fraud_confidence),
+        "risk_level": fraud_risk_level,
+        "explanation": fraud_explanation,
+        "detected_patterns": detected_keywords if is_fraud else [],
+        "fraud_categories": {k: v for k, v in category_counts.items() if v > 0} if is_fraud else {},
+        
+        # Voice type detection (AI vs Human)
+        "voice_type": voice_type,
+        "voice_confidence": round(float(voice_confidence), 2),
+        "voice_explanation": voice_explanation,
+        
+        # Language detection
         "language_code": lang_code,
         "language_name": resolve_language_name(lang_code),
+        "language": resolve_language_name(lang_code),
         "language_confidence": round(float(lang_prob), 2),
+        
+        # Transcript
+        "transcribed_text": transcribed_text[:500] if transcribed_text else "",
     }
 
 
 def predict_audio_bytes(audio_bytes: bytes, name_hint: str = "audio.mp3") -> Dict[str, object]:
     """Predict from in-memory audio bytes (avoids writing a temp file)."""
-    # librosa can read file-like objects; attach a name to help format detection
-    buf = io.BytesIO(audio_bytes)
-    buf.name = name_hint
-
-    features = extract_features(buf)
-    prob = model.predict_proba([features])[0]
-    prediction = model.predict([features])[0]
-
-    label = "AI-generated" if prediction == 1 else "Human"
-    confidence = max(prob)
-
-    explanation = (
-        "Synthetic spectral patterns detected"
-        if label == "AI-generated"
-        else "Natural pitch and prosody detected"
-    )
-
-    # For language detection, we still need a Path; write a short-lived temp file
+    # Write temp file for fraud detection and language detection
     suffix = Path(name_hint).suffix or ".mp3"
-    tmp_path = Path(f"temp_lang_{os.getpid()}_{id(buf)}{suffix}")
+    tmp_path = Path(f"temp_fraud_{os.getpid()}_{id(audio_bytes)}{suffix}")
     try:
         tmp_path.write_bytes(audio_bytes)
+        
+        # 1. AI vs Human voice detection using trained model
+        buf = io.BytesIO(audio_bytes)
+        buf.name = name_hint
+        features = extract_features(buf)
+        prob = model.predict_proba([features])[0]
+        prediction = model.predict([features])[0]
+        
+        voice_type = "AI-generated" if prediction == 1 else "Human"
+        voice_confidence = max(prob)
+        voice_explanation = (
+            "Synthetic spectral patterns detected"
+            if voice_type == "AI-generated"
+            else "Natural pitch and prosody detected"
+        )
+        
+        # 2. Enhanced fraud keyword detection
+        is_fraud, transcribed_text, detected_keywords, category_counts = detect_fraud_keywords(tmp_path)
+        
+        # Calculate fraud risk level
+        fraud_risk_level = None
+        fraud_confidence = 0.90
+        if is_fraud:
+            num_categories = sum(1 for count in category_counts.values() if count > 0)
+            total_keywords = len(detected_keywords)
+            
+            if num_categories >= 3 or total_keywords >= 5:
+                fraud_risk_level = "CRITICAL"
+                fraud_confidence = 0.98
+            elif num_categories >= 2 or total_keywords >= 3:
+                fraud_risk_level = "HIGH"
+                fraud_confidence = 0.95
+            elif num_categories >= 1 or total_keywords >= 2:
+                fraud_risk_level = "MEDIUM"
+                fraud_confidence = 0.90
+            else:
+                fraud_confidence = 0.85
+        
+        if is_fraud:
+            fraud_label = "Fraud"
+            fraud_explanation = f"Detected {len(detected_keywords)} fraud keywords across {sum(1 for c in category_counts.values() if c > 0)} categories"
+        else:
+            fraud_label = "Safe Call"
+            fraud_explanation = "No fraud indicators detected in the audio content"
+        
+        # 3. Language detection
         lang_code, lang_prob = detect_language(tmp_path)
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
 
     return {
-        "label": label,
-        "confidence": float(confidence),
-        "explanation": explanation,
+        # Fraud detection results
+        "classification": fraud_label,
+        "label": fraud_label,
+        "confidence": float(fraud_confidence),
+        "risk_level": fraud_risk_level,
+        "explanation": fraud_explanation,
+        "detected_patterns": detected_keywords if is_fraud else [],
+        "fraud_categories": {k: v for k, v in category_counts.items() if v > 0} if is_fraud else {},
+        
+        # Voice type detection (AI vs Human)
+        "voice_type": voice_type,
+        "voice_confidence": round(float(voice_confidence), 2),
+        "voice_explanation": voice_explanation,
+        
+        # Language detection
         "language_code": lang_code,
         "language_name": resolve_language_name(lang_code),
+        "language": resolve_language_name(lang_code),
         "language_confidence": round(float(lang_prob), 2),
+        
+        # Transcript
+        "transcribed_text": transcribed_text[:500] if transcribed_text else "",
     }
+
+
+def analyze_conversation(audio_bytes: bytes) -> dict:
+    """
+    Analyze a two-way conversation from audio bytes.
+    Separates speakers and analyzes each for fraud/spam indicators.
+    
+    Returns:
+        dict: Analysis of both sides of the conversation including:
+              - speaker_1: Analysis for first speaker
+              - speaker_2: Analysis for second speaker (if detected)
+              - conversation_summary: Overall assessment
+              - is_fraud: Whether fraud detected from either side
+              - fraud_source: Which speaker (if any) showed fraud indicators
+    """
+    try:
+        # Save audio to temp file
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+            tmp_file.write(audio_bytes)
+        
+        # Load audio with pydub for speaker separation
+        try:
+            audio = AudioSegment.from_file(str(tmp_path))
+        except Exception as e:
+            # If conversion fails, try direct analysis
+            return {
+                "error": f"Could not process audio: {str(e)}",
+                "fallback_analysis": predict_audio_bytes(audio_bytes)
+            }
+        
+        # Split audio based on silence to identify different speakers
+        # This is a simple heuristic - longer silence suggests turn-taking
+        chunks = split_on_silence(
+            audio,
+            min_silence_len=800,  # 800ms of silence
+            silence_thresh=audio.dBFS - 16,  # 16dB below average
+            keep_silence=400  # Keep 400ms of silence for context
+        )
+        
+        if len(chunks) == 0:
+            # No clear speaker separation, analyze as single audio
+            return {
+                "speakers_detected": 1,
+                "speaker_1": predict_audio_bytes(audio_bytes),
+                "conversation_summary": {
+                    "is_fraud": predict_audio_bytes(audio_bytes)["classification"] == "Fraud",
+                    "fraud_source": "speaker_1" if predict_audio_bytes(audio_bytes)["classification"] == "Fraud" else None,
+                    "overall_risk": predict_audio_bytes(audio_bytes).get("risk_level", "LOW")
+                }
+            }
+        
+        # Group chunks by speaker (simple alternating pattern assumption)
+        # In real scenarios, you''d use voice embeddings to cluster
+        speaker_1_chunks = []
+        speaker_2_chunks = []
+        
+        for i, chunk in enumerate(chunks):
+            if i % 2 == 0:
+                speaker_1_chunks.append(chunk)
+            else:
+                speaker_2_chunks.append(chunk)
+        
+        # Combine chunks for each speaker
+        speaker_1_audio = sum(speaker_1_chunks) if speaker_1_chunks else None
+        speaker_2_audio = sum(speaker_2_chunks) if speaker_2_chunks else None
+        
+        result = {
+            "speakers_detected": 2 if speaker_2_audio else 1,
+            "conversation_analysis": True
+        }
+        
+        # Analyze speaker 1
+        if speaker_1_audio:
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as s1_file:
+                s1_path = Path(s1_file.name)
+                speaker_1_audio.export(str(s1_path), format='wav')
+                
+            with s1_path.open('rb') as f:
+                speaker_1_bytes = f.read()
+            
+            result["speaker_1"] = predict_audio_bytes(speaker_1_bytes)
+            result["speaker_1"]["duration_seconds"] = len(speaker_1_audio) / 1000.0
+            result["speaker_1"]["speaking_turns"] = len(speaker_1_chunks)
+            
+            s1_path.unlink()
+        
+        # Analyze speaker 2
+        if speaker_2_audio:
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as s2_file:
+                s2_path = Path(s2_file.name)
+                speaker_2_audio.export(str(s2_path), format='wav')
+                
+            with s2_path.open('rb') as f:
+                speaker_2_bytes = f.read()
+            
+            result["speaker_2"] = predict_audio_bytes(speaker_2_bytes)
+            result["speaker_2"]["duration_seconds"] = len(speaker_2_audio) / 1000.0
+            result["speaker_2"]["speaking_turns"] = len(speaker_2_chunks)
+            
+            s2_path.unlink()
+        
+        # Generate conversation summary
+        speaker_1_fraud = result.get("speaker_1", {}).get("classification") == "Fraud"
+        speaker_2_fraud = result.get("speaker_2", {}).get("classification") == "Fraud" if "speaker_2" in result else False
+        
+        speaker_1_ai = result.get("speaker_1", {}).get("voice_type") == "AI-generated"
+        speaker_2_ai = result.get("speaker_2", {}).get("voice_type") == "AI-generated" if "speaker_2" in result else False
+        
+        # Determine overall fraud risk
+        fraud_sources = []
+        if speaker_1_fraud:
+            fraud_sources.append("speaker_1")
+        if speaker_2_fraud:
+            fraud_sources.append("speaker_2")
+        
+        # Get highest risk level
+        risk_levels = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+        speaker_1_risk = result.get("speaker_1", {}).get("risk_level", "LOW")
+        speaker_2_risk = result.get("speaker_2", {}).get("risk_level", "LOW") if "speaker_2" in result else "LOW"
+        
+        overall_risk = speaker_1_risk if risk_levels.get(speaker_1_risk, 0) >= risk_levels.get(speaker_2_risk, 0) else speaker_2_risk
+        
+        result["conversation_summary"] = {
+            "is_fraud": speaker_1_fraud or speaker_2_fraud,
+            "fraud_detected_from": fraud_sources if fraud_sources else None,
+            "overall_risk_level": overall_risk if fraud_sources else "SAFE",
+            "ai_voices_detected": speaker_1_ai or speaker_2_ai,
+            "ai_voice_from": [s for s, is_ai in [("speaker_1", speaker_1_ai), ("speaker_2", speaker_2_ai)] if is_ai],
+            "recommendation": _generate_conversation_recommendation(speaker_1_fraud, speaker_2_fraud, speaker_1_ai, speaker_2_ai, overall_risk)
+        }
+        
+        # Cleanup
+        tmp_path.unlink()
+        
+        return result
+        
+    except Exception as e:
+        return {
+            "error": f"Conversation analysis failed: {str(e)}",
+            "fallback_analysis": predict_audio_bytes(audio_bytes)
+        }
+
+
+def _generate_conversation_recommendation(s1_fraud: bool, s2_fraud: bool, s1_ai: bool, s2_ai: bool, risk_level: str) -> str:
+    """Generate actionable recommendation based on conversation analysis"""
+    if s1_fraud and s2_fraud:
+        return "CRITICAL: Both parties showing fraud indicators - terminate call immediately and report"
+    elif s1_fraud:
+        return f"WARNING: Caller showing fraud patterns ({risk_level} risk) - exercise extreme caution"
+    elif s2_fraud:
+        return f"WARNING: Recipient showing fraud patterns ({risk_level} risk) - verify their identity"
+    elif s1_ai or s2_ai:
+        speakers = []
+        if s1_ai:
+            speakers.append("caller")
+        if s2_ai:
+            speakers.append("recipient")
+        return f"ALERT: AI-generated voice detected from {'' and ''.join(speakers)} - potential deepfake scam"
+    else:
+        return "No immediate fraud indicators detected - conversation appears legitimate"
